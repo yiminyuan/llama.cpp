@@ -24,6 +24,7 @@
 #include <iterator>
 #include <regex>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <unordered_set>
@@ -524,6 +525,43 @@ void string_replace_all(std::string & s, const std::string & search, const std::
 std::string regex_escape(const std::string & s) {
     static const std::regex special_chars("[.^$|()*+?\\[\\]{}\\\\]");
     return std::regex_replace(s, special_chars, "\\$&");
+}
+
+common_tp_groups common_tp_groups_parse(const std::string & value) {
+    const std::string spec = string_strip(value);
+    if (spec.empty()) {
+        throw std::invalid_argument("no devices specified");
+    }
+    if (spec == "all") {
+        return {};
+    }
+
+    common_tp_groups groups;
+
+    std::set<std::string> seen;
+
+    for (const auto & group_spec : string_split<std::string>(spec, '/')) {
+        const std::string group_str = string_strip(group_spec);
+        if (group_str.empty()) {
+            throw std::invalid_argument(string_format("empty device group in '%s'", spec.c_str()));
+        }
+
+        std::vector<std::string> group;
+        for (const auto & name_spec : string_split<std::string>(group_str, '+')) {
+            const std::string name = string_strip(name_spec);
+            if (name.empty()) {
+                throw std::invalid_argument(string_format("empty device name in group '%s'", group_str.c_str()));
+            }
+            if (!seen.insert(name).second) {
+                throw std::invalid_argument(string_format("device %s is listed more than once", name.c_str()));
+            }
+            group.push_back(name);
+        }
+
+        groups.push_back(std::move(group));
+    }
+
+    return groups;
 }
 
 std::string string_join(const std::vector<std::string> & values, const std::string & separator) {
@@ -1682,6 +1720,10 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
 
     if (!params.devices.empty()) {
         mparams.devices = params.devices.data();
+    }
+
+    if (!params.tensor_parallel_groups.empty()) {
+        mparams.tensor_parallel_groups = params.tensor_parallel_groups.data();
     }
 
     mparams.n_gpu_layers    = params.n_gpu_layers;

@@ -195,24 +195,72 @@ static void register_rpc_server_list(const std::string & servers) {
     }
 }
 
-static std::string devices_to_string(const std::vector<ggml_backend_dev_t> & devices) {
-    if (devices.empty()) {
+struct cmd_params_devices {
+    std::vector<ggml_backend_dev_t> devs;   // 0-terminated
+    std::vector<uint32_t>           groups; // device count per tensor-parallel group, 0-terminated
+
+    bool operator==(const cmd_params_devices & other) const {
+        return devs == other.devs && groups == other.groups;
+    }
+
+    bool operator!=(const cmd_params_devices & other) const { return !(*this == other); }
+};
+
+static cmd_params_devices parse_tp_groups_arg(const std::string & value) {
+    cmd_params_devices res;
+
+    for (const auto & group : common_tp_groups_parse(value)) {
+        for (const auto & name : group) {
+            auto * dev = ggml_backend_dev_by_name(name.c_str());
+            if (!dev || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+                throw std::invalid_argument(string_format("invalid device: %s", name.c_str()));
+            }
+            res.devs.push_back(dev);
+        }
+        res.groups.push_back((uint32_t) group.size());
+    }
+
+    if (!res.devs.empty()) {
+        res.devs.push_back(nullptr);
+        res.groups.push_back(0);
+    }
+
+    return res;
+}
+
+static std::string devices_to_string(const cmd_params_devices & devices) {
+    if (devices.devs.empty()) {
         return "auto";
     }
 
-    if (devices.size() == 1 && devices[0] == nullptr) {
+    if (devices.devs.size() == 1 && devices.devs[0] == nullptr) {
         return "none";
     }
 
     std::vector<std::string> names;
-    for (auto * dev : devices) {
+    for (auto * dev : devices.devs) {
         if (dev == nullptr) {
             break;
         }
         names.push_back(ggml_backend_dev_name(dev));
     }
 
-    return join(names, "/");
+    if (devices.groups.empty()) {
+        return join(names, "/");
+    }
+
+    // render the groups the way --tensor-parallel-group takes them
+    std::vector<std::string> groups;
+    size_t i_dev = 0;
+    for (uint32_t n : devices.groups) {
+        if (n == 0) {
+            break;
+        }
+        groups.push_back(join(std::vector<std::string>(names.begin() + i_dev, names.begin() + i_dev + n), "+"));
+        i_dev += n;
+    }
+
+    return join(groups, "/");
 }
 
 // command line params
@@ -344,7 +392,7 @@ struct cmd_params {
     std::vector<int>                 main_gpu;
     std::vector<bool>                no_kv_offload;
     std::vector<llama_flash_attn_type> flash_attn;
-    std::vector<std::vector<ggml_backend_dev_t>> devices;
+    std::vector<cmd_params_devices>              devices;
     std::vector<std::vector<float>>  tensor_split;
     std::vector<std::vector<llama_model_tensor_buft_override>> tensor_buft_overrides;
     std::vector<bool>                embeddings;
@@ -459,6 +507,7 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  -nkvo, --no-kv-offload <0|1>                      (default: %s)\n", join(cmd_params_defaults.no_kv_offload, ",").c_str());
     printf("  -fa, --flash-attn <on|off|auto>                   (default: %s)\n", join(transform_to_str(cmd_params_defaults.flash_attn, llama_flash_attn_type_name), ",").c_str());
     printf("  -dev, --device <dev0/dev1/...>                    (default: auto)\n");
+    printf("  -tpg, --tensor-parallel-group <dev0+dev1/dev2>    (default: all, needs -sm tensor)\n");
     printf("  -lm, --load-mode <auto|none|mmap|mlock|mmap+mlock|dio> (default: %s)\n", join(transform_to_str(cmd_params_defaults.load_mode, llama_load_mode_name), ",").c_str());
     printf("  -mmp, --mmap <0|1>                                (DEPRECATED IN FAVOUR OF --load-mode)\n");
     printf("  -dio, --direct-io <0|1>                           (DEPRECATED IN FAVOUR OF --load-mode)\n");
@@ -659,7 +708,25 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 auto combos = string_split<std::string>(argv[i], split_delim);
                 for (const auto & combo : combos) {
                     try {
-                        params.devices.push_back(parse_devices_arg(combo));
+                        params.devices.push_back({ parse_devices_arg(combo), {} });
+                    } catch (const std::exception & e) {
+                        fprintf(stderr, "error: %s\n", e.what());
+                        invalid_param = true;
+                        break;
+                    }
+                }
+                if (invalid_param) {
+                    break;
+                }
+            } else if (arg == "-tpg" || arg == "--tensor-parallel-group") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                auto combos = string_split<std::string>(argv[i], split_delim);
+                for (const auto & combo : combos) {
+                    try {
+                        params.devices.push_back(parse_tp_groups_arg(combo));
                     } catch (const std::exception & e) {
                         fprintf(stderr, "error: %s\n", e.what());
                         invalid_param = true;
@@ -1149,6 +1216,18 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     if (params.devices.empty()) {
         params.devices = cmd_params_defaults.devices;
     }
+
+    for (const auto & devs : params.devices) {
+        if (devs.groups.empty()) {
+            continue;
+        }
+        for (const auto & sm : params.split_mode) {
+            if (sm != LLAMA_SPLIT_MODE_TENSOR) {
+                fprintf(stderr, "error: --tensor-parallel-group requires --split-mode tensor\n");
+                exit(1);
+            }
+        }
+    }
     if (params.tensor_split.empty()) {
         params.tensor_split = cmd_params_defaults.tensor_split;
     }
@@ -1206,7 +1285,7 @@ struct cmd_params_instance {
     int                main_gpu;
     bool               no_kv_offload;
     llama_flash_attn_type flash_attn;
-    std::vector<ggml_backend_dev_t> devices;
+    cmd_params_devices devices;
     std::vector<float> tensor_split;
     std::vector<llama_model_tensor_buft_override> tensor_buft_overrides;
     bool               embeddings;
@@ -1219,8 +1298,11 @@ struct cmd_params_instance {
         llama_model_params mparams = llama_model_default_params();
 
         mparams.n_gpu_layers = n_gpu_layers;
-        if (!devices.empty()) {
-            mparams.devices = const_cast<ggml_backend_dev_t *>(devices.data());
+        if (!devices.devs.empty()) {
+            mparams.devices = const_cast<ggml_backend_dev_t *>(devices.devs.data());
+        }
+        if (!devices.groups.empty()) {
+            mparams.tensor_parallel_groups = devices.groups.data();
         }
         mparams.split_mode    = split_mode;
         mparams.load_mode     = load_mode;
@@ -1460,7 +1542,7 @@ struct test {
     int                      main_gpu;
     bool                     no_kv_offload;
     llama_flash_attn_type    flash_attn;
-    std::vector<ggml_backend_dev_t> devices;
+    cmd_params_devices       devices;
     std::vector<float>       tensor_split;
     std::vector<llama_model_tensor_buft_override> tensor_buft_overrides;
     bool                     embeddings;

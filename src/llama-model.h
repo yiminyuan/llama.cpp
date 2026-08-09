@@ -673,8 +673,9 @@ struct llama_model {
     // for keeping track of associated LoRA adapters
     std::unordered_set<llama_adapter_lora *> loras;
 
-    // statically allocated context for assigning
-    struct llama_meta_device_get_split_state_userdata get_split_state_ud;
+    // statically allocated context for assigning, one per tensor-parallel group
+    // the Meta devices keep pointers into it, so it must not be resized after they are created
+    std::vector<struct llama_meta_device_get_split_state_userdata> get_split_state_uds;
 
     int64_t t_load_us  = 0;
     int64_t t_start_us = 0;

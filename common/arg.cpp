@@ -759,6 +759,48 @@ static void common_params_apply_system_config(common_params & params, llama_exam
     }
 }
 
+// turn the parsed groups into the offload device list plus the per-group device counts
+static void resolve_tp_groups(common_params & params) {
+    if (params.tp_groups.empty()) {
+        return;
+    }
+
+    if (params.split_mode != LLAMA_SPLIT_MODE_TENSOR) {
+        throw std::invalid_argument("--tensor-parallel-group requires --split-mode tensor");
+    }
+
+    ggml_backend_load_all();
+
+    std::vector<ggml_backend_dev_t> devices;
+    for (const auto & group : params.tp_groups) {
+        for (const auto & name : group) {
+            auto * dev = ggml_backend_dev_by_name(name.c_str());
+            if (!dev || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+                throw std::invalid_argument(string_format("invalid device: %s", name.c_str()));
+            }
+            devices.push_back(dev);
+        }
+        params.tensor_parallel_groups.push_back((uint32_t) group.size());
+    }
+    params.tensor_parallel_groups.push_back(0);
+
+    // --device may be given as well, but then it has to select the same devices
+    if (!params.devices.empty()) {
+        std::vector<ggml_backend_dev_t> selected(params.devices.begin(), params.devices.end());
+        selected.erase(std::remove(selected.begin(), selected.end(), nullptr), selected.end());
+
+        std::vector<ggml_backend_dev_t> grouped = devices;
+        std::sort(selected.begin(), selected.end());
+        std::sort(grouped.begin(), grouped.end());
+        if (selected != grouped) {
+            throw std::invalid_argument("--device and --tensor-parallel-group must list the same devices");
+        }
+    }
+
+    devices.push_back(nullptr);
+    params.devices = std::move(devices);
+}
+
 static bool common_params_parse_ex(int argc, char ** argv, common_params_context & ctx_arg) {
     common_params & params = ctx_arg.params;
 
@@ -897,6 +939,8 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
     if (params.prompt_cache_all && (params.interactive || params.interactive_first)) {
         throw std::invalid_argument("error: --prompt-cache-all not supported in interactive mode yet\n");
     }
+
+    resolve_tp_groups(params);
 
     const bool skip_model_download =
         // server will call common_params_handle_models() later, so we skip it here
@@ -2722,6 +2766,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.devices = parse_device_list(value);
         }
     ).set_env("LLAMA_ARG_DEVICE"));
+    add_opt(common_arg(
+        {"-tpg", "--tensor-parallel-group"}, "<dev1+dev2/dev3,..>",
+        "device groups for --split-mode tensor, '+' joins a group and '/' separates groups\n"
+        "the listed devices are the ones used for offloading (default: all)",
+        [](common_params & params, const std::string & value) {
+            params.tp_groups = common_tp_groups_parse(value);
+        }
+    ).set_env("LLAMA_ARG_TENSOR_PARALLEL_GROUP"));
     add_opt(common_arg(
         {"--list-devices"},
         "print list of available devices and exit",

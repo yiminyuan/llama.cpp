@@ -437,6 +437,9 @@ struct lr_opt {
 
 struct ggml_opt_optimizer_params common_opt_lr_pars(void * userdata);
 
+// tensor-parallel device groups, one group per entry
+typedef std::vector<std::vector<std::string>> common_tp_groups;
+
 struct common_params {
     int32_t n_predict             =    -1; // max. number of new tokens to predict, -1 == no limit
     int32_t n_ctx                 =     0; // context size, 0 == context the model was trained with
@@ -461,6 +464,9 @@ struct common_params {
 
     // offload params
     std::vector<ggml_backend_dev_t> devices; // devices to use for offloading
+
+    common_tp_groups      tp_groups;              // tensor-parallel groups, by device name
+    std::vector<uint32_t> tensor_parallel_groups; // the same groups as device counts, 0-terminated
 
     int32_t n_gpu_layers       = -1;    // number of layers to store in VRAM, -1 is auto, <= -2 is all
     int32_t main_gpu           = 0;     // the GPU that is used for scratch and small tensors
@@ -781,6 +787,10 @@ std::string string_repeat(const std::string & str, size_t n);
 void string_replace_all(std::string & s, const std::string & search, const std::string & replace);
 
 std::string regex_escape(const std::string & s);
+
+// parse a --tensor-parallel-group value: "all" (one group with all devices), or "dev0+dev1/dev2"
+// throws std::invalid_argument if the value is malformed
+common_tp_groups common_tp_groups_parse(const std::string & value);
 
 template<class T>
 static std::vector<T> string_split(const std::string & str, char delim) {
