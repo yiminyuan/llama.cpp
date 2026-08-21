@@ -43,8 +43,9 @@ static ggml_context * new_ctx() {
 }
 
 //
-// a fake backend whose compute is delegated to the CPU; the buffer type is reported as non-host,
-// which is needed to cover code paths that check ggml_backend_buffer_is_host
+// a fake backend whose buffer type refuses to allocate above a configured size, used to force a
+// deterministic out-of-memory in the meta backend allocation path without depending on the host
+// having a particular amount of free memory
 //
 
 static ggml_status fake_backend_buffer_init_tensor(ggml_backend_buffer_t, ggml_tensor *) { return GGML_STATUS_SUCCESS; }
@@ -204,6 +205,40 @@ static ggml_backend_dev_t fake_backend_create(size_t max_buffer_size, bool is_ho
     return devs.back().get();
 }
 
+// regression test: when a simple buffer of a meta buffer fails to allocate (e.g. out of memory),
+// the meta allocation must release the meta buffer (freeing the simple buffers that were already
+// allocated) and return NULL so the caller can report a clean error, instead of aborting
+static int test_meta_alloc_oom() {
+    // device A can allocate, device B cannot; the meta allocation must fail cleanly
+    ggml_backend_dev_t dev_a = fake_backend_create(/*max_buffer_size =*/ 1 << 30);
+    ggml_backend_dev_t dev_b = fake_backend_create(/*max_buffer_size =*/ 0);
+
+    ggml_backend_dev_t meta_devs[2] = { dev_a, dev_b };
+    ggml_backend_dev_t meta_dev     = ggml_backend_meta_device(meta_devs, 2, test_meta_get_split_state, nullptr);
+    ggml_backend_buffer_type_t meta_buft = ggml_backend_dev_buffer_type(meta_dev);
+
+    ggml_context * ctx = new_ctx();
+    ggml_tensor * t = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 256);
+    ggml_set_name(t, "t");
+
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, meta_buft);
+    if (buf != nullptr) {
+        fprintf(stderr, "fail: expected the meta allocation to fail, but it succeeded\n");
+        ggml_backend_buffer_free(buf);
+        ggml_free(ctx);
+        return 1;
+    }
+    // the original tensors must be restored to the unallocated state
+    if (t->buffer != nullptr || t->data != nullptr) {
+        fprintf(stderr, "fail: tensor not restored to the unallocated state after the OOM (buffer = %p, data = %p)\n",
+                (void *) t->buffer, t->data);
+        ggml_free(ctx);
+        return 1;
+    }
+    ggml_free(ctx);
+    return 0;
+}
+
 // w and a are split along axis 0 (each device gets half the rows), so their mul_mat is a
 // PARTIAL node: each device computes a partial sum that the meta backend all-reduces
 static ggml_backend_meta_split_state test_meta_get_split_state_k(const struct ggml_tensor * tensor, void * userdata) {
@@ -355,6 +390,11 @@ static int test_meta_stray_view_after_partial() {
 
 int main() {
     ggml_backend_load_all();
+
+    // a simple buffer failing to allocate must make the meta allocation fail cleanly, not abort
+    if (test_meta_alloc_oom() != 0) {
+        return 1;
+    }
 
     // a stray view after a PARTIAL node must not abort the AllReduce-delay scan
     if (test_meta_stray_view_after_partial() != 0) {
