@@ -473,7 +473,16 @@ static ggml_backend_buffer_t ggml_backend_meta_buffer_simple_buffer(ggml_backend
 }
 
 static struct ggml_tensor * ggml_backend_meta_buffer_simple_tensor(const struct ggml_tensor * tensor, size_t index) {
-    GGML_ASSERT(ggml_backend_buffer_is_meta(tensor->buffer));
+    if (!ggml_backend_buffer_is_meta(tensor->buffer)) {
+        // diagnostic: a node of another backend (typically a view op of a tensor outside the
+        // meta group) landed in the meta subgraph; identify it instead of failing opaquely
+        GGML_ABORT("%s: tensor '%s' (op = %s, buffer = %s, view_src = '%s' (op = %s, buffer = %s)) is not in a meta buffer\n",
+            __func__, tensor->name, ggml_op_name(tensor->op),
+            tensor->buffer ? ggml_backend_buffer_name(tensor->buffer) : "null",
+            tensor->view_src ? tensor->view_src->name : "null",
+            tensor->view_src ? ggml_op_name(tensor->view_src->op) : "null",
+            tensor->view_src && tensor->view_src->buffer ? ggml_backend_buffer_name(tensor->view_src->buffer) : "null");
+    }
     ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) tensor->buffer->context;
     GGML_ASSERT(index < buf_ctx->bufs.size());
 
@@ -1168,7 +1177,16 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
 }
 
 static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(const struct ggml_tensor * tensor, bool assume_sync) {
-    GGML_ASSERT(ggml_backend_buffer_is_meta(tensor->buffer));
+    if (!ggml_backend_buffer_is_meta(tensor->buffer)) {
+        // a node of another backend (typically a view op of a tensor outside the meta group)
+        // reached the meta split state; identify it instead of failing opaquely
+        GGML_ABORT("%s: tensor '%s' (op = %s, buffer = %s, view_src = '%s' (op = %s, buffer = %s)) is not in a meta buffer\n",
+            __func__, tensor->name, ggml_op_name(tensor->op),
+            tensor->buffer ? ggml_backend_buffer_name(tensor->buffer) : "null",
+            tensor->view_src ? tensor->view_src->name : "null",
+            tensor->view_src ? ggml_op_name(tensor->view_src->op) : "null",
+            tensor->view_src && tensor->view_src->buffer ? ggml_backend_buffer_name(tensor->view_src->buffer) : "null");
+    }
     ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) tensor->buffer->context;
     return ggml_backend_meta_get_split_state(buf_ctx->get_simple_tensor_container(tensor), tensor, assume_sync);
 }
@@ -1945,6 +1963,16 @@ static void ggml_backend_meta_synchronize(ggml_backend_t backend) {
     }
 }
 
+// the scheduler skips view ops when forming split boundaries, so a view of a tensor outside
+// the meta group (e.g. a state tensor owned by another simple group in a tensor-parallel-group
+// setup, or a host tensor) can end up in a meta split. such ops are no-ops and their data stays
+// with the view_src, so they are passed through to the simple backends as-is and have no split state
+static bool ggml_backend_meta_is_stray_view(const struct ggml_tensor * node) {
+    return !ggml_backend_buffer_is_meta(node->buffer) &&
+           (node->op == GGML_OP_VIEW || node->op == GGML_OP_RESHAPE ||
+            node->op == GGML_OP_PERMUTE || node->op == GGML_OP_TRANSPOSE);
+}
+
 static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     GGML_ASSERT(cgraph->grads == nullptr);
     const size_t n_backends = ggml_backend_meta_n_backends(backend);
@@ -1994,9 +2022,10 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
 
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
-                if (node->view_src != nullptr && node->view_src->op == GGML_OP_NONE && ggml_backend_buffer_is_host(node->view_src->buffer)) {
-                    // FIXME s_copy_main is on the CPU and its view seems to be incorrectly added to the graph nodes.
-                    // For regular usage this doesn't matter since it's a noop but trying to call ggml_backend_meta_buffer_simple_tensor results in a crash.
+                if (ggml_backend_meta_is_stray_view(node)) {
+                    // a no-op view of a tensor outside the meta group, e.g. a state tensor owned
+                    // by another simple group in a tensor-parallel-group setup; the simple
+                    // backends execute it as a no-op, so pass the original node through as-is
                     bcj.nodes[i] = node;
                     continue;
                 }
@@ -2007,6 +2036,13 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
 
         {
             // For MoE models it may make sense to delay the AllReduce in order to reduce I/O:
+            // a stray view (see ggml_backend_meta_is_stray_view) has no split state, so report
+            // its axis as NONE to treat it as unrelated in the checks below
+            auto get_split_axis = [](ggml_tensor * t) {
+                return ggml_backend_meta_is_stray_view(t) ?
+                    GGML_BACKEND_SPLIT_AXIS_NONE : ggml_backend_meta_get_split_state(t, false).axis;
+            };
+
             auto get_i_delayed_branch = [&](const int i) -> int {
                 int id = i; // i_delayed
                 int idr = i; // i_delayed return, last safe return value
@@ -2018,7 +2054,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 auto skip_unrelated = [&]() {
                     while (id + 1 < cgraph->n_nodes) {
                         ggml_tensor * next = cgraph->nodes[id+1];
-                        if (ggml_backend_meta_get_split_state(next, false).axis != GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+                        if (get_split_axis(next) != GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
                             break;
                         }
                         bool safe = true;
@@ -2030,7 +2066,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                                 safe = false;
                                 break;
                             }
-                            if (ggml_backend_meta_get_split_state(next->src[s], false).axis != GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+                            if (get_split_axis(next->src[s]) != GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
                                 safe = false;
                                 break;
                             }
@@ -2049,8 +2085,8 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 {
                     ggml_tensor * next = cgraph->nodes[id+1];
                     if (next->op == GGML_OP_ADD_ID && next->src[0] == node &&
-                            ggml_backend_meta_get_split_state(next->src[1], false).axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL &&
-                            ggml_backend_meta_get_split_state(next->src[2], false).axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+                            get_split_axis(next->src[1]) == GGML_BACKEND_SPLIT_AXIS_PARTIAL &&
+                            get_split_axis(next->src[2]) == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
                         node = next;
                         id++;
                         idr = id;
@@ -2065,7 +2101,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     }
                     ggml_tensor * next = cgraph->nodes[id+1];
                     if (next->op == GGML_OP_MUL && next->src[0] == node &&
-                            ggml_backend_meta_get_split_state(next->src[1], false).axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+                            get_split_axis(next->src[1]) == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
                         node = next;
                         id++;
                         idr = id;
@@ -2130,7 +2166,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     if (next->view_src != nullptr && next->view_src->op == GGML_OP_NONE && ggml_backend_buffer_is_host(next->view_src->buffer)) {
                         continue;
                     }
-                    if (ggml_backend_meta_get_split_state(next, false).axis != GGML_BACKEND_SPLIT_AXIS_PARTIAL) {
+                    if (get_split_axis(next) != GGML_BACKEND_SPLIT_AXIS_PARTIAL) {
                         continue;
                     }
 
@@ -2166,10 +2202,12 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             int i_start = 0;
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
-                if (node->view_src != nullptr && node->view_src->op == GGML_OP_NONE && ggml_backend_buffer_is_host(node->view_src->buffer)) {
-                    continue;
-                }
-                const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(node, /*assume_sync =*/ false);
+                // a no-op view of a tensor outside the meta group has no split state, but as the
+                // last node of the graph it still starts the final subgraph
+                const bool is_stray_view = ggml_backend_meta_is_stray_view(node);
+                const ggml_backend_meta_split_state split_state = is_stray_view ?
+                        (ggml_backend_meta_split_state{ GGML_BACKEND_SPLIT_AXIS_NONE, {0}, {1}, 0 }) :
+                        ggml_backend_meta_get_split_state(node, /*assume_sync =*/ false);
                 if (split_state.axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL) {
                     max_tmp_size = std::max(max_tmp_size, ggml_nbytes(node));
                 }

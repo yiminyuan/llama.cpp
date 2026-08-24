@@ -358,6 +358,9 @@ if (NOT LLAMA_USE_SYSTEM_GGML)
 
     # Needs non-public ggml{,-backend}-impl.h
     llama_build_and_test(test-alloc.cpp)
+
+    # meta backend + scheduler, CPU-only
+    llama_build_and_test(test-meta.cpp)
 endif()
 
 llama_build(test-export-graph-ops.cpp)
